@@ -1,0 +1,163 @@
+#include <ESP8266WiFi.h>
+#include <AccelStepper.h>
+#include <ESP8266WebServer.h>
+
+// Replace with your network credentials
+const char* ssid = "Gunaseelan";
+const char* password = "gunaseelan";
+
+// Web server running on port 80
+ESP8266WebServer server(80);
+
+// Define step constant: full step mode = 4
+#define FULLSTEP 4
+
+// ULN2003 Motor Driver Pins
+#define IN1 5  // D1 on NodeMCU
+#define IN2 4  // D2 on NodeMCU
+#define IN3 14 // D5 on NodeMCU
+#define IN4 12 // D6 on NodeMCU
+
+// Define relay pins
+#define solenoid_valve_pin 2 // D4 on NodeMCU
+#define vacuum_motor_pin 13  // D7 on NodeMCU
+
+const int stepsPerAction = 500; // Number of steps for each motor action
+
+// Create an instance of AccelStepper
+AccelStepper myStepper(FULLSTEP, IN1, IN3, IN2, IN4);
+
+unsigned long actionStartTime = 0;
+bool motorForwardDone = false;
+bool vacuumOn = false;
+bool motorReverseDone = false;
+bool waitDone = false;
+bool solenoidOn = false;
+bool sequenceStarted = false;   // Changed from sequenceCompleted to sequenceStarted to manage the flow better
+bool solenoidOffDelayStarted = false;  // Flag to manage solenoid valve off delay
+unsigned long solenoidStartTime = 0;   // Timestamp for solenoid on time
+
+void setup() {
+  Serial.begin(115200);
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.println("Connecting to WiFi...");
+  
+  // Wait for the Wi-Fi connection
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  // Print the IP address
+  Serial.println();
+  Serial.println("Connected to WiFi!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // Stepper motor setup
+  myStepper.setMaxSpeed(1000); // Adjust speed as needed
+  myStepper.setAcceleration(100); // Adjust acceleration as needed
+
+  // Pin setup
+  pinMode(vacuum_motor_pin, OUTPUT);
+  pinMode(solenoid_valve_pin, OUTPUT);
+  digitalWrite(vacuum_motor_pin, LOW); // Start with vacuum pump OFF
+  digitalWrite(solenoid_valve_pin, LOW); // Start with solenoid valve OFF
+  
+  // Setup web server routes
+  server.on("/startSequence", []() {
+    server.send(200, "text/plain", "Sequence started");
+    startSequence();  // Start the sequence when a web request is received
+    Serial.println("Sequence triggered by web request");
+  });
+  
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+void loop() {
+  // Handle web requests
+  server.handleClient();
+
+  // Only run the sequence if it has been triggered
+  if (sequenceStarted) {
+    runSequence(); // Manage the stepper, vacuum pump, and solenoid valve actions
+  }
+}
+
+// Function to start the sequence by setting the initial states
+void startSequence() {
+  actionStartTime = millis();
+  motorForwardDone = false;
+  vacuumOn = false;
+  motorReverseDone = false;
+  waitDone = false;
+  solenoidOn = false;
+  sequenceStarted = true;
+  solenoidOffDelayStarted = false;  // Reset solenoid delay flag
+  
+  // Move the stepper motor forward to the target position
+  myStepper.moveTo(stepsPerAction);
+}
+
+// Function that handles the motor and component actions
+void runSequence() {
+  unsigned long currentTime = millis();
+  unsigned long elapsedTime = currentTime - actionStartTime;
+
+  // Stepper motor control for moving forward
+  if (!motorForwardDone) {
+    myStepper.run();  // Keep calling run to allow the motor to move
+    if (myStepper.distanceToGo() == 0) {
+      motorForwardDone = true;
+      actionStartTime = millis(); // Reset action timer
+      Serial.println("Motor forward done");
+    }
+  }
+
+  // Turn on the vacuum pump after motor has moved forward
+  if (motorForwardDone && !vacuumOn && elapsedTime >= 0 && elapsedTime < 5000) {
+    digitalWrite(vacuum_motor_pin, HIGH); // Turn vacuum pump ON
+    vacuumOn = true;
+    Serial.println("Vacuum pump ON");
+  }
+
+  // Stepper motor control for moving backward after vacuum pump is on
+  if (vacuumOn && elapsedTime >= 5000 && !motorReverseDone) {
+    myStepper.moveTo(-stepsPerAction);  // Move the motor backward
+    myStepper.run();
+    if (myStepper.distanceToGo() == 0) {
+      motorReverseDone = true;
+      actionStartTime = millis(); // Reset action timer
+      Serial.println("Motor backward done");
+    }
+  }
+
+  // Wait after motor reverse
+  if (motorReverseDone && !waitDone && elapsedTime >= 10000) {
+    if (elapsedTime >= 15000) {
+      waitDone = true;
+      actionStartTime = millis(); // Start solenoid valve action
+      Serial.println("Wait period done");
+    }
+  }
+
+  // Turn on solenoid valve and turn off vacuum pump after wait period
+  if (waitDone && !solenoidOn && elapsedTime >= 0 && elapsedTime < 5000) {
+    digitalWrite(solenoid_valve_pin, HIGH); // Turn solenoid valve ON
+    digitalWrite(vacuum_motor_pin, LOW);    // Turn vacuum pump OFF
+    solenoidOn = true;
+    solenoidStartTime = millis(); // Capture the solenoid on time
+    Serial.println("Solenoid valve ON, Vacuum pump OFF");
+  }
+
+  // After 2 seconds, turn the solenoid valve OFF
+  if (solenoidOn && !solenoidOffDelayStarted && (currentTime - solenoidStartTime >= 2000)) {
+    digitalWrite(solenoid_valve_pin, LOW);  // Turn solenoid valve OFF after 2 seconds
+    solenoidOffDelayStarted = true; // Mark the delay as completed
+    sequenceStarted = false;  // End the sequence
+    Serial.println("Solenoid valve OFF after 2 seconds");
+  }
+}
